@@ -180,9 +180,21 @@ jobs:
           for f in tools/linuxfs/overlay/usr/bin/* tools/linuxfs/overlay/usr/bin/steamos-polkit-helpers/*; do
             [ -f "$f" ] && install -Dm644 "$f" "$D/${f#tools/linuxfs/overlay/}"
           done
+          # A fork carries none of these releases: after this repository, the project's own two
+          # (public) are tried. The sha256 check below is what decides whether the file is used.
+          fetch_release() {
+            for repo in "${GITHUB_REPOSITORY}" Droid-Deck/DroidDeck The412Banner/DroidDeck; do
+              if gh release download "$1" -R "$repo" -p "$2" -O "$2" --clobber 2>/dev/null; then
+                echo "$2 from $repo ($1)"
+                return 0
+              fi
+            done
+            echo "::error::release $1 ($2) found in none of ${GITHUB_REPOSITORY}, Droid-Deck/DroidDeck, The412Banner/DroidDeck"
+            return 1
+          }
           if [ -f tools/gamescope/release.env ]; then
             . tools/gamescope/release.env
-            gh release download "${GAMESCOPE_TAG}" -R "${GITHUB_REPOSITORY}" -p gamescope.tzst -O gamescope.tzst
+            fetch_release "${GAMESCOPE_TAG}" gamescope.tzst
             echo "${GAMESCOPE_SHA256}  gamescope.tzst" | sha256sum -c -
             tar --use-compress-program=unzstd -xf gamescope.tzst -C "$D"
             test -f "$D/usr/local/bin/gamescope"
@@ -190,7 +202,7 @@ jobs:
           fi
           if [ -f tools/wlroots/release.env ]; then
             . tools/wlroots/release.env
-            gh release download "${WLROOTS_TAG}" -R "${GITHUB_REPOSITORY}" -p wlroots.tzst -O wlroots.tzst
+            fetch_release "${WLROOTS_TAG}" wlroots.tzst
             echo "${WLROOTS_SHA256}  wlroots.tzst" | sha256sum -c -
             tar --use-compress-program=unzstd -xf wlroots.tzst -C "$D"
             test -f "$D/usr/local/lib/droiddeck-wlroots/libwlroots-0.20.so"
