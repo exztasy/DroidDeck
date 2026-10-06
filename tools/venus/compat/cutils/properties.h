@@ -4,6 +4,7 @@
 #include <string.h>
 #include <sys/system_properties.h>
 
+#define PROPERTY_KEY_MAX 32
 #define PROPERTY_VALUE_MAX PROP_VALUE_MAX
 
 static inline int
