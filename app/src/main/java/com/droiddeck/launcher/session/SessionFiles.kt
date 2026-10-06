@@ -95,9 +95,13 @@ object SessionFiles {
         val wlroots = if (File(root, "usr/bin/labwc").isFile) {
             arrayOf("usr/local/lib/droiddeck-wlroots/libwlroots-0.20.so" to "usr/local/lib/droiddeck-wlroots/libwlroots-0.20.so")
         } else emptyArray()
+        // The runtime's half of the Mali bridge (tools/venus): Mesa's Venus driver, its manifest and
+        // vulkaninfo, which the session uses only on a GPU Turnip cannot drive (gpu/VenusServer).
+        val venus = listOf("libvulkan_virtio.so", "virtio_icd.json", "vulkaninfo")
+            .map { "usr/local/lib/droiddeck-venus/$it".let { path -> path to path } }
         val optional = (arrayOf(
             "usr/local/bin/gamescope" to "usr/local/bin/gamescope",
-        ) + wlroots + mangoapp).filter { (asset, _) ->
+        ) + wlroots + mangoapp + venus).filter { (asset, _) ->
             val dir = asset.substringBeforeLast('/')
             runCatching { context.assets.list("linuxfs/$dir")?.contains(asset.substringAfterLast('/')) == true }.getOrDefault(false)
         }

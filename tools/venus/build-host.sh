@@ -48,7 +48,7 @@ strip = '$TOOLCHAIN/llvm-strip'
 pkg-config = 'pkg-config'
 
 [built-in options]
-c_args = ['-ffile-prefix-map=$WORK=.']
+c_args = ['-ffile-prefix-map=$WORK=.', '-I$HERE/compat']
 c_link_args = ['-Wl,-z,noexecstack']
 
 [properties]
@@ -70,11 +70,13 @@ meson setup "$WORK/epoxy-build" "$WORK/epoxy" --cross-file "$WORK/cross.ini" --p
 ninja -C "$WORK/epoxy-build" install
 
 # Venus only: --no-virgl at run time, so no GL platform is needed (gbm does not exist here).
+# compat/ stands in for the two AOSP headers (log/log.h, cutils/properties.h) the bundled Mesa util
+# code includes when it sees Android, on the NDK's liblog and system properties.
 # The device's Vulkan is dlopen'ed (vulkan-dload); the render server runs each context on a thread.
 meson setup "$WORK/virgl-build" "$WORK/virgl" --cross-file "$WORK/cross.ini" --prefix "$PREFIX" \
   --libdir lib --buildtype release -Ddefault_library=static \
   -Dvenus=true -Dvulkan-dload=true -Drender-server-worker=thread -Dplatforms=auto \
-  -Dtests=false -Dc_link_args="['-Wl,-z,noexecstack','-lnativewindow']"
+  -Dtests=false -Dc_link_args="['-Wl,-z,noexecstack','-lnativewindow','-llog']"
 ninja -C "$WORK/virgl-build" vtest/virgl_test_server server/virgl_render_server
 
 install -m755 "$WORK/virgl-build/vtest/virgl_test_server" "$OUTDIR/libvirgl_test_server.so"

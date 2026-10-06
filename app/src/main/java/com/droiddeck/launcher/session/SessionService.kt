@@ -2,6 +2,7 @@ package com.droiddeck.launcher.session
 
 import com.droiddeck.launcher.gpu.LinuxVulkanDriver
 import com.droiddeck.launcher.gpu.LinuxVulkanDriverManager
+import com.droiddeck.launcher.gpu.VenusServer
 
 import android.app.Notification
 import android.app.NotificationChannel
@@ -27,6 +28,7 @@ import com.droiddeck.launcher.audio.DirectAudioRelayComponent
 import com.droiddeck.launcher.audio.PulseAudioComponent
 import com.droiddeck.launcher.core.CpuCores
 import com.droiddeck.launcher.core.DeviceReport
+import com.droiddeck.launcher.core.DeviceSupport
 import com.droiddeck.launcher.core.GpuReport
 import com.droiddeck.launcher.core.HostEnvironment
 import com.droiddeck.launcher.core.SessionLogCapture
@@ -275,9 +277,21 @@ class SessionService : Service() {
         // The desktop's Steam launchers start the client there (bannerlator-steam-launch), through the
         // same set-up as a Steam session: it gets what the client and its games are started with.
         val steamHere = SessionState.mode == MODE_STEAM || SessionState.mode == MODE_DESKTOP
-        addClientEnvironment(guest, runtimeDir, steamHere)
+        // Mali: Turnip has no GPU here, so the session draws through Venus to a server on the
+        // device's own driver (gpu/VenusServer). Its socket sits in the runtime dir, which the
+        // session sees at the same path.
+        val venus = if (DeviceSupport.family() != DeviceSupport.Family.MALI) null
+            else if (!VenusServer.available(this, root)) {
+                Log.w(TAG, "venus: Mali, but the server or the runtime's Venus driver is missing; drawing with Turnip")
+                null
+            } else VenusServer(File(runtimeDir, "venus.sock"), File(sessionDir, "venus.log"))
+        addClientEnvironment(guest, runtimeDir, steamHere, venus?.socket())
 
         val pulse = startAudio(guest, sessionDir)
+        venus?.let {
+            it.attach(this)
+            components.add(it)
+        }
 
         guest.add("BL_WIDTH=" + size.first)
         guest.add("BL_HEIGHT=" + size.second)
@@ -481,7 +495,7 @@ class SessionService : Service() {
     }
 
     /** The guest's base environment: paths, the display, the GL/Vulkan stack and the client's switches. */
-    private fun addClientEnvironment(guest: MutableList<String>, runtimeDir: File, steamHere: Boolean) {
+    private fun addClientEnvironment(guest: MutableList<String>, runtimeDir: File, steamHere: Boolean, venusSocket: File?) {
         guest.add("/usr/bin/env")
         guest.add("-i")
         guest.add("HOME=/root")
@@ -500,7 +514,18 @@ class SessionService : Service() {
         guest.add("MESA_LOADER_DRIVER_OVERRIDE=zink")
         guest.add("GALLIUM_DRIVER=zink")
         guest.add("LIBGL_KOPPER_DRI2=true")
-        LinuxRuntime.vulkanIcd(this)?.let { guest.add("VK_ICD_FILENAMES=" + it.path) }
+        if (venusSocket != null) {
+            // Venus only: the loader must not also try the runtime's Turnip, which finds no KGSL.
+            val icd = "/" + VenusServer.GUEST_ICD
+            guest.add("VK_ICD_FILENAMES=$icd")
+            guest.add("VK_DRIVER_FILES=$icd")
+            guest.add("VN_DEBUG=vtest")
+            guest.add("VTEST_SOCKET_NAME=" + venusSocket.path)
+            guest.add("BL_VENUS=1")
+            Log.i(TAG, "venus: the session draws through Venus on ${DeviceSupport.gpuName()} ($venusSocket)")
+        } else {
+            LinuxRuntime.vulkanIcd(this)?.let { guest.add("VK_ICD_FILENAMES=" + it.path) }
+        }
         // An imported glibc Turnip for this mode, when the user chose one: the session script checks
         // the manifest and its library from inside and points the loader at it with VK_DRIVER_FILES,
         // so the runtime's own driver above stays untouched and is what a bad import falls back to.
@@ -516,7 +541,7 @@ class SessionService : Service() {
         // Downloads holds the value verbatim ("sysmem", "sysmem,deck_emu"); with nothing there, an
         // imported driver from the A710/A720/A722 legs gets "sysmem" on its own, which is what both
         // its authors advise for those GPUs and what nothing else in the list needs.
-        tuDebug(linuxDriverId)?.let { guest.add("TU_DEBUG=$it") }
+        if (venusSocket == null) tuDebug(linuxDriverId)?.let { guest.add("TU_DEBUG=$it") }
         // Zink renders the client's UI (Chromium -> ANGLE -> Zink -> Turnip). Lazy descriptors is
         // the mode Zink recommends where the driver has no descriptor buffer, and what Ludashi ships
         // by default for its Zink path; a switch here because on one Fold the menus run at 14 fps.
