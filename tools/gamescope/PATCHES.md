@@ -39,5 +39,14 @@ library list, before anything is published.
   then focus is handed over again. `GAMESCOPE_RESTORE_FOCUS_WINDOW` on the root window asks for the
   same restore from outside (the session script's resume watcher).
 
+- `0120-run-without-a-drm-node.patch` - this app: on a Mali phone the runtime's Vulkan is Mesa's
+  Venus over a vtest socket (tools/venus), which reports VK_EXT_physical_device_drm with no node,
+  has no VK_KHR_external_semaphore_fd, and cannot import dma-bufs. gamescope then runs as on a
+  device without the DRM extension: no explicit sync, flippable images exported LINEAR from a
+  host-visible type (the server shares those as gralloc buffers), wl_shm uploads composited
+  rather than flipped and copied at every commit (the buffer memo kept showing a redrawn
+  wl_buffer's first frame). Every change is keyed on the device naming no DRM node, so Turnip on
+  Adreno takes none of them.
+
 Sixteen more of Armada's patches are DRM/lease/HDR-on-KMS work for a native display, which this
 app's Wayland-hosted gamescope never reaches, or need a newer gamescope than the runtime has.

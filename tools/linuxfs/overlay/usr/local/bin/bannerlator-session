@@ -81,6 +81,9 @@ if [ "${BL_VENUS:-0}" = 1 ] && [ -z "${BL_INSIDE:-}" ]; then
   bl_vkinfo=/usr/local/lib/droiddeck-venus/vulkaninfo
   if [ -x "$bl_vkinfo" ]; then
     VN_DEBUG=vtest,init timeout 30 "$bl_vkinfo" --summary 2>&1 | sed 's/^/== vulkaninfo: /'
+    # The whole report beside the log: the features gamescope asks for at device creation
+    # (nullDescriptor, timelineSemaphore, scalarBlockLayout, ...) are only in the long form.
+    [ -n "${BL_DEBUG_DIR:-}" ] && timeout 30 "$bl_vkinfo" > "$BL_DEBUG_DIR/venus-vulkaninfo.txt" 2>&1
   fi
   unset bl_vkinfo
 fi

@@ -521,6 +521,10 @@ class SessionService : Service() {
             guest.add("VK_DRIVER_FILES=$icd")
             guest.add("VN_DEBUG=vtest")
             guest.add("VTEST_SOCKET_NAME=" + venusSocket.path)
+            // Venus over a socket can export a dma-buf but not import one, and there is no DRM
+            // node for DRI3: every program presents through CPU images instead (wl_shm on
+            // Wayland, PutImage on X11). gamescope's own output is unaffected - it uses no WSI.
+            guest.add("MESA_VK_WSI_DEBUG=sw")
             guest.add("BL_VENUS=1")
             Log.i(TAG, "venus: the session draws through Venus on ${DeviceSupport.gpuName()} ($venusSocket)")
         } else {
@@ -535,7 +539,8 @@ class SessionService : Service() {
         // starting it (RPCS3's 6650 interpreter variants on each first boot).
         val driverMode = if (SessionState.mode == MODE_RUN) MODE_DESKTOP else SessionPrefs.prefMode(SessionState.mode)
         val linuxDriverId = SessionPrefs.linuxDriver(this, driverMode)
-        LinuxVulkanDriver.resolveIcdPath(this, linuxDriverId)
+        // Not on Mali: an imported Turnip finds no KGSL there and would replace Venus.
+        if (venusSocket == null) LinuxVulkanDriver.resolveIcdPath(this, linuxDriverId)
             ?.let { guest.add(LinuxVulkanDriver.ENV + "=" + it) }
         // Turnip's own debug switches, for the runtime's driver and everything on it. The file in
         // Downloads holds the value verbatim ("sysmem", "sysmem,deck_emu"); with nothing there, an

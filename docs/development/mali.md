@@ -36,19 +36,29 @@ the printed sha256 in `tools/venus/release.env`.
 
 ## Status
 
-1. **The runtime has a Vulkan device on Mali.** Built, not yet confirmed on a device.
-2. **gamescope presents.** Not done. Venus over vtest can export dma-bufs but not import them, and
-   gamescope imports its clients' buffers. This needs a vtest extension that passes fds from the
-   runtime to the server.
-3. **Steam's UI.** Not done. Xwayland's GPU path needs a DRM node, which the Pixel does not give
-   apps; on Adreno a KGSL stand-in fills that role (`tools/linuxfs/preload/drm.c`).
+1. **The runtime has a Vulkan device on Mali.** Confirmed on the Pixel 8a: `vulkaninfo` in the
+   runtime reports `Virtio-GPU Venus (Mali-G715)`, Vulkan 1.4.334.
+2. **gamescope presents.** In progress. Venus over vtest reports no DRM node, has no
+   VK_KHR_external_semaphore_fd and cannot import dma-bufs (the import call is a null function
+   in the vtest renderer). So:
+   - gamescope runs without a DRM node (`tools/gamescope/patches/0120-…`): no explicit sync, its
+     output exported LINEAR from gralloc-backed memory;
+   - the server offers dma-buf export and allocates every exportable buffer through gralloc
+     (`tools/venus/patches/0001-…`);
+   - every program in the runtime presents through CPU images (`MESA_VK_WSI_DEBUG=sw`), so
+     gamescope never has to import a dma-buf: wl_shm on Wayland, PutImage on X11.
+3. **Steam's UI.** Follows from 2: CEF (ANGLE on Vulkan) and Zink present through the same CPU
+   path, and Xwayland runs without glamor. Slow (a GPU-to-CPU copy per frame) until dma-buf
+   import exists over the socket, which needs a vtest protocol extension and our own Mesa build.
 
 ## Testing on a device
 
 Start a Steam session, then open its folder in `Download/DroidDeck/`:
 
 - `session.log`: the `== vulkan driver: Venus` line, then `== vulkaninfo:` lines. A working bridge
-  shows a device named `Virtio-GPU Venus (Mali-G715)`.
+  shows a device named `Virtio-GPU Venus (Mali-G715)`. gamescope's own lines follow; with no DRM
+  node it says `physical device names no DRM node; running without one`.
+- `venus-vulkaninfo.txt`: the full report, with the device's features.
 - `venus.log`: the server's own output.
 - `gpu.txt`: what the system driver offers (written on every non-Adreno session).
 - `app.log`: the `VenusServer` and `venus:` lines say whether the server started and why not.

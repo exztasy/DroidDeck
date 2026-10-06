@@ -1,0 +1,208 @@
+gamescope: run on a Vulkan device that names no DRM node (Venus over vtest)
+
+On a Mali phone the runtime's Vulkan is Mesa's Venus over a vtest socket to a server on the
+device's own driver. Venus reports VK_EXT_physical_device_drm with no primary and no render node,
+has no VK_KHR_external_semaphore_fd (vtest has no external sync), and can neither import dma-bufs
+nor export them except through the server's host-visible (gralloc) allocations. With no node:
+
+- createDevice runs as if the extension were absent instead of failing on the primary node;
+- VK_KHR_external_semaphore_fd is optional and the Wayland backend offers no explicit sync
+  (DRM syncobj timelines need a render node);
+- flippable images skip the host's DRM_FORMAT_MOD_INVALID entry, and with no exportable modifier
+  fall back to a plain LINEAR image exported as DRM_FORMAT_MOD_LINEAR instead of asserting;
+- exportable images prefer a host-visible memory type, the one the server shares as gralloc;
+- wl_shm textures are composited rather than flipped, and copied again at every commit (the
+  per-wlr_buffer memo kept showing the first copy of a redrawn wl_buffer).
+
+A device with a DRM node (Turnip on Adreno) takes none of these paths.
+
+diff --git a/src/Backends/WaylandBackend.cpp b/src/Backends/WaylandBackend.cpp
+index c400978..6dd558d 100644
+--- a/src/Backends/WaylandBackend.cpp
++++ b/src/Backends/WaylandBackend.cpp
+@@ -2330,7 +2330,8 @@ namespace gamescope
+ 
+     bool CWaylandBackend::SupportsExplicitSync() const
+     {
+-        return true;
++        // DRM syncobj timelines need a DRM render node.
++        return g_device.drmRenderFd() >= 0 || !g_device.noDrmNode();
+     }
+ 
+     bool CWaylandBackend::IsPaused() const
+diff --git a/src/rendervulkan.cpp b/src/rendervulkan.cpp
+index ffad695..2f29fb0 100644
+--- a/src/rendervulkan.cpp
++++ b/src/rendervulkan.cpp
+@@ -478,6 +478,12 @@ bool CVulkanDevice::createDevice()
+ 		};
+ 		vk.GetPhysicalDeviceProperties2( physDev(), &props2 );
+ 
++		if ( !drmProps.hasPrimary && !drmProps.hasRender ) {
++			// Venus over vtest reports the extension with no nodes at all: there is no DRM device
++			// behind it to open. Run as without VK_EXT_physical_device_drm.
++			vk_log.warnf( "physical device names no DRM node; running without one" );
++			m_bNoDrmNode = true;
++		} else {
+ 		if ( !GetBackend()->UsesVulkanSwapchain() && !drmProps.hasPrimary ) {
+ 			vk_log.errorf( "physical device has no primary node" );
+ 			return false;
+@@ -507,6 +513,7 @@ bool CVulkanDevice::createDevice()
+ 			m_bHasDrmPrimaryDevId = true;
+ 			m_drmPrimaryDevId = makedev( drmProps.primaryMajor, drmProps.primaryMinor );
+ 		}
++		}
+ #else
+ 		vk_log.warnf( "built without DRM support" );
+ #endif
+@@ -594,7 +601,16 @@ bool CVulkanDevice::createDevice()
+ 	enabledExtensions.push_back( VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME );
+ 	enabledExtensions.push_back( VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME );
+ 
+-	enabledExtensions.push_back( VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME );
++	// Only explicit sync (DRM syncobj timelines) uses it, and that needs a DRM node.
++	bool supportsSemaphoreFd = false;
++	for ( const auto& ext : m_supportedExts ) {
++		if ( strcmp( ext.extensionName, VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME ) == 0 )
++			supportsSemaphoreFd = true;
++	}
++	if ( supportsSemaphoreFd || !m_bNoDrmNode )
++		enabledExtensions.push_back( VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME );
++	else
++		vk_log.infof( "no VK_KHR_external_semaphore_fd and no DRM node: explicit sync off" );
+ 
+ 	enabledExtensions.push_back( VK_EXT_ROBUSTNESS_2_EXTENSION_NAME );
+ #if 0
+@@ -2251,6 +2267,9 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
+ 		for ( size_t i = 0; i < numPossibleModifiers; i++ )
+ 		{
+ 			uint64_t modifier = possibleModifiers[i];
++			// Not a layout: the host's "implicit" entry, never one to create an image with.
++			if ( modifier == DRM_FORMAT_MOD_INVALID )
++				continue;
+ 
+ 			VkExternalImageFormatProperties externalFormatProps = {
+ 				.sType = VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES,
+@@ -2269,8 +2288,15 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
+ 			modifiers.push_back( modifier );
+ 		}
+ 
+-		assert( modifiers.size() > 0 );
++		if ( modifiers.empty() && !g_device.noDrmNode() )
++		{
++			vk_log.errorf( "no exportable modifier for format 0x%x", drmFormat );
++			return false;
++		}
++	}
+ 
++	if ( !modifiers.empty() )
++	{
+ 		modifierListInfo = {
+ 			.sType = VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT,
+ 			.pNext = std::exchange(imageInfo.pNext, &modifierListInfo),
+@@ -2287,7 +2313,18 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
+ 		imageInfo.tiling = tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
+ 	}
+ 
+-	if ( flags.bFlippable == true && tiling != VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT )
++	if ( flags.bFlippable == true && tiling != VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT && g_device.noDrmNode() && !pDMA )
++	{
++		// No modifier to export with and no DRM node: a plain linear image, exported as
++		// DRM_FORMAT_MOD_LINEAR, which any importer understands.
++		imageInfo.tiling = tiling = VK_IMAGE_TILING_LINEAR;
++		externalImageCreateInfo = {
++			.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
++			.pNext = std::exchange(imageInfo.pNext, &externalImageCreateInfo),
++			.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
++		};
++	}
++	else if ( flags.bFlippable == true && tiling != VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT )
+ 	{
+ 		// We want to scan-out the image
+ 		wsiImageCreateInfo = {
+@@ -2337,6 +2374,14 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
+ 		.allocationSize = memRequirements.size,
+ 		.memoryTypeIndex = uint32_t(g_device.findMemoryType(properties, memRequirements.memoryTypeBits)),
+ 	};
++	// Without a DRM node the exported memory is shared through the renderer's host-visible
++	// allocations (Venus on Android: gralloc buffers); ask for one where the image allows it.
++	if ( flags.bExportable && !pDMA && g_device.noDrmNode() )
++	{
++		int32_t visibleType = g_device.findMemoryType( properties | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, memRequirements.memoryTypeBits );
++		if ( visibleType >= 0 )
++			allocInfo.memoryTypeIndex = uint32_t( visibleType );
++	}
+ 
+ 	m_size = allocInfo.allocationSize;
+ 
+@@ -2548,7 +2593,7 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
+ 			g_device.vk.GetImageSubresourceLayout( g_device.device(), m_vkImage, &subresource, &subresourceLayout );
+ 
+ 			dmabuf.n_planes = 1;
+-			dmabuf.modifier = DRM_FORMAT_MOD_INVALID;
++			dmabuf.modifier = tiling == VK_IMAGE_TILING_LINEAR && g_device.noDrmNode() ? DRM_FORMAT_MOD_LINEAR : DRM_FORMAT_MOD_INVALID;
+ 			dmabuf.offset[0] = 0;
+ 			dmabuf.stride[0] = subresourceLayout.rowPitch;
+ 		}
+@@ -4820,7 +4865,9 @@ gamescope::OwningRc<CVulkanTexture> vulkan_create_texture_from_wlr_buffer( struc
+ 	CVulkanTexture::createFlags texCreateFlags;
+ 	texCreateFlags.bSampled = true;
+ 	texCreateFlags.bTransferDst = true;
+-	texCreateFlags.bFlippable = true;
++	// Without a DRM node every flippable texture is a gralloc export the host imports; a CPU
++	// upload is composited instead.
++	texCreateFlags.bFlippable = !g_device.noDrmNode();
+ 	if ( pTex->BInit( width, height, 1u, drmFormat, texCreateFlags, nullptr, 0, 0, nullptr, pBackendFb ) == false )
+ 		return nullptr;
+ 
+diff --git a/src/rendervulkan.hpp b/src/rendervulkan.hpp
+index fa519db..edd71c9 100644
+--- a/src/rendervulkan.hpp
++++ b/src/rendervulkan.hpp
+@@ -863,6 +863,9 @@ public:
+ 	inline int drmRenderFd() {return m_drmRendererFd;}
+ 	inline bool supportsModifiers() {return m_bSupportsModifiers;}
+ 	inline bool hasDrmPrimaryDevId() {return m_bHasDrmPrimaryDevId;}
++	// The device names no DRM node at all (Venus over a vtest socket on a GPU apps cannot open, e.g.
++	// Mali under Android): no render fd, no explicit sync, linear exports.
++	inline bool noDrmNode() {return m_bNoDrmNode;}
+ 	inline dev_t primaryDevId() {return m_drmPrimaryDevId;}
+ 	inline bool supportsFp16() {return m_bSupportsFp16;}
+ 	inline std::vector<VkExtensionProperties>& supportedExtensions() {return m_supportedExts;}
+@@ -929,6 +932,7 @@ protected:
+ 	bool m_bSupportsFp16 = false;
+ 	uint32_t m_uVendorID = 0;
+ 	bool m_bHasDrmPrimaryDevId = false;
++	bool m_bNoDrmNode = false;
+ 	bool m_bSupportsModifiers = false;
+ 	bool m_bInitialized = false;
+ 
+diff --git a/src/steamcompmgr.cpp b/src/steamcompmgr.cpp
+index 372a82c..976b69e 100644
+--- a/src/steamcompmgr.cpp
++++ b/src/steamcompmgr.cpp
+@@ -1850,7 +1850,13 @@ import_commit (
+ 		commit->fifo = false;
+ 	}
+ 
+-	if ( gamescope::OwningRc<CVulkanTexture> pTexture = s_BufferMemos.LookupVulkanTexture( buf ) )
++	// A CPU (wl_shm) buffer is copied when its texture is made; the same wl_buffer redrawn and
++	// committed again would keep showing that first copy. Without a DRM node every client buffer
++	// is one, so it is copied again at each commit.
++	struct wlr_dmabuf_attributes memoDmabuf = {0};
++	const bool bMemoize = !g_device.noDrmNode() || wlr_buffer_get_dmabuf( buf, &memoDmabuf );
++
++	if ( gamescope::OwningRc<CVulkanTexture> pTexture = bMemoize ? s_BufferMemos.LookupVulkanTexture( buf ) : nullptr )
+ 	{
+ 		// Going from OwningRc -> Rc now.
+ 		commit->vulkanTex = pTexture;
+@@ -1873,7 +1879,8 @@ import_commit (
+ 
+ 	commit->vulkanTex = pOwnedTexture;
+ 
+-	s_BufferMemos.MemoizeBuffer( buf, std::move( pOwnedTexture ) );
++	if ( bMemoize )
++		s_BufferMemos.MemoizeBuffer( buf, std::move( pOwnedTexture ) );
+ 
+ 	return commit;
+ }
