@@ -179,6 +179,12 @@ public final class WaylandCompositor {
     private static native void nativeTextInputPreedit(byte[] utf8, int cursorBegin, int cursorEnd);
     private static native void nativeTextInputDelete(int before, int after);
 
+    /**
+     * The system Vulkan driver's device, extensions and memory export types, as report text
+     * (gpu_probe.c). Loads and closes the system driver on its own; the compositor is untouched.
+     */
+    public static native String nativeProbeSystemVulkan();
+
     /** Start the compositor headless (no output window) - bring-up tests only. */
     public static native void nativeStart(String xdgRuntimeDir);
 

@@ -20,6 +20,7 @@ add_library(bannerwayland SHARED
         src/wl_color_mgmt.c
         src/hdr_compose.c
         src/blend_pass.c
+        src/gpu_probe.c
         generated/color-management-v1-protocol.c
         generated/xdg-shell-protocol.c
         generated/linux-dmabuf-v1-protocol.c

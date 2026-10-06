@@ -373,6 +373,9 @@ void vkp_output_size(int *w, int *h) {
 
 static void init_black_image(void);
 
+/* The device has every extension a dma-buf import needs (dev_init); 0 on a driver that lacks one. */
+static int g_dmabuf_ok;
+
 static int has_ext(VkExtensionProperties *e, uint32_t n, const char *name) {
     for (uint32_t i = 0; i < n; i++)
         if (!strcmp(e[i].extensionName, name)) return 1;
@@ -383,7 +386,8 @@ static int has_ext(VkExtensionProperties *e, uint32_t n, const char *name) {
 static int dev_init(void) {
     if (g_dev_state != 0) return g_dev_state == 1 ? 0 : -1;
 
-    /* Load Turnip (adrenotools) and its entry points - NOT the system driver. */
+    /* Load Turnip (adrenotools) and its entry points; the system driver only where no Turnip was
+     * chosen - a black session on Adreno, but the driver that works on Mali (TurnipDriver.java). */
     if (vk_loader_open(g_driver_path, g_library_name, g_native_lib_dir) != 0) {
         LOGE("present: vk_loader_open failed"); g_dev_state = -1; return -1;
     }
@@ -450,18 +454,28 @@ static int dev_init(void) {
     }
     g_vk.GetPhysicalDeviceMemoryProperties(g_pd, &g_memprops);
 
-    /* Verify the dmabuf-import extensions are present, and log any that are missing. */
-    const char *dev_exts[7] = {VK_KHR_SWAPCHAIN_EXTENSION_NAME, "VK_KHR_external_memory_fd",
-                               "VK_EXT_external_memory_dma_buf", "VK_EXT_image_drm_format_modifier",
-                               "VK_KHR_image_format_list", NULL, NULL};
-    uint32_t n_dev_exts = 5;
+    /* The dmabuf-import extensions, enabled only where the driver has them: asking for a missing one
+     * fails vkCreateDevice outright, and a compositor that cannot import a dma-buf can still show
+     * every wl_shm client. Turnip has all four; a system driver (Mali on Tensor, Xclipse) may not. */
+    static const char *const dmabuf_exts[4] = {"VK_KHR_external_memory_fd", "VK_EXT_external_memory_dma_buf",
+                                               "VK_EXT_image_drm_format_modifier", "VK_KHR_image_format_list"};
+    const char *dev_exts[7] = {VK_KHR_SWAPCHAIN_EXTENSION_NAME, NULL, NULL, NULL, NULL, NULL, NULL};
+    uint32_t n_dev_exts = 1;
     uint32_t ne = 0;
     g_vk.EnumerateDeviceExtensionProperties(g_pd, NULL, &ne, NULL);
     VkExtensionProperties *exts = calloc(ne ? ne : 1, sizeof(*exts));
     g_vk.EnumerateDeviceExtensionProperties(g_pd, NULL, &ne, exts);
-    for (unsigned i = 0; i < 5; i++)
-        if (!has_ext(exts, ne, dev_exts[i]))
-            LOGE("present: driver MISSING %s (dmabuf import will fail)", dev_exts[i]);
+    g_dmabuf_ok = 1;
+    for (unsigned i = 0; i < 4; i++) {
+        if (has_ext(exts, ne, dmabuf_exts[i])) {
+            dev_exts[n_dev_exts++] = dmabuf_exts[i];
+        } else {
+            g_dmabuf_ok = 0;
+            LOGE("present: driver MISSING %s (dmabuf import will fail)", dmabuf_exts[i]);
+        }
+    }
+    banner_log("gpu", "compositor %s dma-buf client buffers%s", g_dmabuf_ok ? "imports" : "CANNOT import",
+               g_dmabuf_ok ? "" : ": only wl_shm clients can be shown (see the MISSING lines in logcat)");
     /* HDR sessions only: the HDR10 swapchain (frame generation) can carry the game's metadata. */
     int want_hdr_md = 0;
     if (banner_color_requested()) {
@@ -899,7 +913,7 @@ static int modifier_importable(VkFormat fmt, uint64_t modifier, VkImageUsageFlag
 }
 
 int vkp_dmabuf_modifiers(uint32_t drm_format, uint64_t *out, int max) {
-    if (max <= 0 || dev_init() != 0 || !g_vk.GetPhysicalDeviceFormatProperties2) return 0;
+    if (max <= 0 || dev_init() != 0 || !g_dmabuf_ok || !g_vk.GetPhysicalDeviceFormatProperties2) return 0;
     VkFormat fmt = drm_to_vk(drm_format);
     VkDrmFormatModifierPropertiesListEXT list = {
         .sType = VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_EXT};
@@ -942,6 +956,12 @@ struct vkp_image *vkp_image_import_dmabuf(int fd, uint32_t drm_format, uint64_t 
                                           uint32_t stride, uint32_t offset, int as_blit_dst) {
     if (modifier == MOD_INVALID || w <= 0 || h <= 0) return NULL;
     if (dev_init() != 0) return NULL;
+    if (!g_dmabuf_ok) {
+        static int said;
+        if (!said++) banner_log("dmabuf", "import refused: the compositor's driver (%s) has no dma-buf import",
+                                vkp_gpu_name());
+        return NULL;
+    }
 
     struct vkp_image *img = calloc(1, sizeof(*img));
     if (!img) return NULL;

@@ -27,6 +27,7 @@ import com.droiddeck.launcher.audio.DirectAudioRelayComponent
 import com.droiddeck.launcher.audio.PulseAudioComponent
 import com.droiddeck.launcher.core.CpuCores
 import com.droiddeck.launcher.core.DeviceReport
+import com.droiddeck.launcher.core.GpuReport
 import com.droiddeck.launcher.core.HostEnvironment
 import com.droiddeck.launcher.core.SessionLogCapture
 import com.droiddeck.launcher.core.NetworkReport
@@ -470,6 +471,8 @@ class SessionService : Service() {
         SessionEvents.record("session.logs_ready", mapOf("logDir" to sessionDir.path))
         // Written first, so a session that dies in its first second still says what it ran on.
         DeviceReport.write(this, File(sessionDir, "device.txt"), SessionState.mode)
+        // Off Adreno (Mali on a Pixel's Tensor): what the system Vulkan driver offers instead.
+        GpuReport.writeAsync(File(sessionDir, "gpu.txt"))
         NetworkReport.write(this, File(sessionDir, "network.txt"))
         // Everything the app decides from here on - the driver it chose, the audio line, a rival
         // client stopped, the exit status - reaches logcat and nowhere a user can get at. Mirror it.

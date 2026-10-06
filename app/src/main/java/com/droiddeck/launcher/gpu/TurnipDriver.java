@@ -5,6 +5,7 @@ import android.net.Uri;
 import android.os.Environment;
 import android.util.Log;
 
+import com.droiddeck.launcher.core.DeviceSupport;
 import com.droiddeck.launcher.core.FileUtils;
 import com.droiddeck.launcher.core.TarZst;
 import com.droiddeck.launcher.session.SessionPrefs;
@@ -267,8 +268,8 @@ public final class TurnipDriver {
 
     /**
      * Unpacks the driver this device needs and returns its id, or null to fall back to the system
-     * Vulkan loader (which means a black session on Adreno, but is better than refusing to start
-     * on a GPU neither build covers).
+     * Vulkan loader (which means a black session on Adreno, but is what a Mali or other non-Adreno
+     * GPU draws with, since neither build covers it).
      */
     public String install() {
         String id = choose();
@@ -321,6 +322,13 @@ public final class TurnipDriver {
             if (forced.startsWith("system")) return null;
             if (forced.startsWith("a8")) return DRIVER_A8XX;
             if (forced.startsWith("a7")) return DRIVER_A7XX;
+        }
+        // Turnip only drives Adreno: on Mali (Tensor) or any other GPU it loads, finds no KGSL and
+        // offers no device, and the compositor would have nothing to draw with. The system Vulkan
+        // driver is the one that works there.
+        if (!DeviceSupport.INSTANCE.adreno()) {
+            Log.i(TAG, "not an Adreno (" + DeviceSupport.INSTANCE.gpuName() + "); compositor uses the system Vulkan driver");
+            return null;
         }
         String model = gpuModel();
         Log.i(TAG, "gpu model: " + (model == null ? "unknown" : model));

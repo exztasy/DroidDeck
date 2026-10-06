@@ -151,7 +151,8 @@ internal fun SetupPanel(
     }
     val colors = MaterialTheme.colorScheme
     val pal = LocalPalette.current
-    val gpuOk = remember { DeviceSupport.adreno() }
+    val gpuFamily = remember { DeviceSupport.family() }
+    val gpuOk = gpuFamily == DeviceSupport.Family.ADRENO
     val gpuName = remember { DeviceSupport.gpuName() }
     val limitBlocks = PhantomProcessLimit.blocksSteam(s.phantomProcessStatus)
     val signedIn = s.offlineAccount != null
@@ -192,8 +193,16 @@ internal fun SetupPanel(
                         Column(modifier = Modifier.fillMaxWidth().clip(Shape14).background(colors.surface).border(1.dp, pal.line, Shape14)) {
                             CheckRow(
                                 if (gpuOk) CheckState.OK else CheckState.WARN,
-                                if (gpuOk) "Device supported" else "GPU not supported",
-                                if (gpuOk) gpuName else "Steam draws with an Adreno driver; $gpuName may show a black screen",
+                                when (gpuFamily) {
+                                    DeviceSupport.Family.ADRENO -> "Device supported"
+                                    DeviceSupport.Family.MALI -> "Mali GPU · experimental"
+                                    DeviceSupport.Family.OTHER -> "GPU not supported"
+                                },
+                                when (gpuFamily) {
+                                    DeviceSupport.Family.ADRENO -> gpuName
+                                    DeviceSupport.Family.MALI -> "$gpuName · the display runs on Android's Mali driver, but the runtime has no Mali driver yet, so Steam may show a black screen"
+                                    DeviceSupport.Family.OTHER -> "Steam draws with an Adreno driver; $gpuName may show a black screen"
+                                },
                             )
                             CheckRow(
                                 when { s.busy -> CheckState.BUSY; !s.ready -> CheckState.WARN; else -> CheckState.OK },

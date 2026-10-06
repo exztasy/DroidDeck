@@ -542,9 +542,12 @@ class MainActivity : ComponentActivity() {
                     onDismiss = { showRoms = false },
                 )
                 showNonAdreno?.let { release ->
+                    val mali = com.droiddeck.launcher.core.DeviceSupport.family() == com.droiddeck.launcher.core.DeviceSupport.Family.MALI
                     ConfirmDialog(
-                        title = "Not an Adreno GPU",
-                        text = "Turnip supports Adreno GPUs. On ${com.droiddeck.launcher.core.DeviceSupport.gpuName()}, Steam may show a black screen. Download: ${"%.0f".format(release.size / 1e6)} MB.",
+                        title = if (mali) "Mali support is experimental" else "Not an Adreno GPU",
+                        text = (if (mali) "The display runs on Android's Mali driver, but the runtime draws with Turnip, an Adreno driver. On ${com.droiddeck.launcher.core.DeviceSupport.gpuName()}, Steam may show a black screen; each session's gpu.txt in Download/DroidDeck records what the GPU offers."
+                                else "Turnip supports Adreno GPUs. On ${com.droiddeck.launcher.core.DeviceSupport.gpuName()}, Steam may show a black screen.") +
+                            " Download: ${"%.0f".format(release.size / 1e6)} MB.",
                         confirm = "Install anyway",
                         onConfirm = { showNonAdreno = null; install(release) },
                         onDismiss = { showNonAdreno = null },
@@ -1144,8 +1147,8 @@ class MainActivity : ComponentActivity() {
             Thread({ checkCatalog() }, "catalog").start()
             return
         }
-        // The runtime draws with Turnip, an Adreno driver: on Mali, Xclipse or PowerVR the
-        // compositor gets no usable Vulkan device and a session is sound over a black screen.
+        // The runtime draws with Turnip, an Adreno driver: on Mali, Xclipse or PowerVR nothing
+        // inside it has a Vulkan device and a session is sound over a black screen.
         // Said before the download, not after it; the user may still go ahead.
         if (installed == null && !com.droiddeck.launcher.core.DeviceSupport.adreno()) { showNonAdreno = release; return }
         install(release)
