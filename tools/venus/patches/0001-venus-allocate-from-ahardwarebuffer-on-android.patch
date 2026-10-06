@@ -1,0 +1,125 @@
+venus: allocate host-visible memory from AHardwareBuffers on Android
+
+A driver that imports dma-bufs but exports no fd (Mali on Google Tensor exports AHardwareBuffers
+only) left vkAllocateMemory with no allocator: gbm and udmabuf do not exist on Android. Gralloc
+allocates a BLOB AHardwareBuffer instead; its dma-buf is imported into Vulkan and kept for the
+blob export the guest maps.
+
+--- a/src/venus/vkr_device_memory.c
++++ b/src/venus/vkr_device_memory.c
+@@ -227,6 +227,102 @@
+ 
+ #endif /* ENABLE_GBM_ALLOCATION */
+ 
++#ifdef __ANDROID__
++#include <android/hardware_buffer.h>
++#include <dlfcn.h>
++#include <pthread.h>
++#include <unistd.h>
++
++/* An Android host whose driver imports dma-bufs but exports no fd at all (Mali: AHardwareBuffer
++ * export only) has neither gbm nor udmabuf to allocate from. Gralloc does the allocation instead:
++ * a BLOB AHardwareBuffer is backed by a dma-buf, which the driver imports and the guest mmaps.
++ *
++ * AHardwareBuffer_getNativeHandle is not in the NDK stubs but libnativewindow exports it; it is
++ * looked up once at runtime. The dma-buf outlives the AHardwareBuffer, so only the fds are kept.
++ */
++struct vkr_native_handle {
++   int version;
++   int num_fds;
++   int num_ints;
++   int data[];
++};
++
++typedef const struct vkr_native_handle *(*vkr_get_native_handle_fn)(const AHardwareBuffer *);
++
++static vkr_get_native_handle_fn vkr_ahb_native_handle_fn;
++
++static void
++vkr_ahb_lookup_native_handle_fn(void)
++{
++   void *lib = dlopen("libnativewindow.so", RTLD_NOW | RTLD_LOCAL);
++   if (lib)
++      *(void **)&vkr_ahb_native_handle_fn = dlsym(lib, "AHardwareBuffer_getNativeHandle");
++   if (!vkr_ahb_native_handle_fn)
++      vkr_log("AHardwareBuffer_getNativeHandle unavailable: %s", dlerror());
++}
++
++static vkr_get_native_handle_fn
++vkr_ahb_get_native_handle_fn(void)
++{
++   static pthread_once_t once = PTHREAD_ONCE_INIT;
++   pthread_once(&once, vkr_ahb_lookup_native_handle_fn);
++   return vkr_ahb_native_handle_fn;
++}
++
++static VkResult
++vkr_ahb_get_fd_info_from_allocation_info(const VkMemoryAllocateInfo *alloc_info,
++                                         int *out_keep_fd,
++                                         VkImportMemoryFdInfoKHR *out_fd_info)
++{
++   const vkr_get_native_handle_fn get_native_handle = vkr_ahb_get_native_handle_fn();
++   if (!get_native_handle)
++      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
++   if (alloc_info->allocationSize > UINT32_MAX)
++      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
++
++   const AHardwareBuffer_Desc desc = {
++      .width = (uint32_t)align(alloc_info->allocationSize, getpagesize()),
++      .height = 1,
++      .layers = 1,
++      .format = AHARDWAREBUFFER_FORMAT_BLOB,
++      .usage = AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN | AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN |
++               AHARDWAREBUFFER_USAGE_GPU_DATA_BUFFER,
++   };
++   AHardwareBuffer *ahb = NULL;
++   int ret = AHardwareBuffer_allocate(&desc, &ahb);
++   if (ret) {
++      vkr_log("AHardwareBuffer_allocate(%u bytes) failed (%d)", desc.width, ret);
++      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
++   }
++
++   const struct vkr_native_handle *handle = get_native_handle(ahb);
++   int fd = -1;
++   int keep_fd = -1;
++   if (handle && handle->num_fds >= 1) {
++      fd = os_dupfd_cloexec(handle->data[0]);
++      keep_fd = os_dupfd_cloexec(handle->data[0]);
++   }
++   AHardwareBuffer_release(ahb);
++   if (fd < 0 || keep_fd < 0) {
++      vkr_log("AHardwareBuffer has no dma-buf fd");
++      if (fd >= 0)
++         close(fd);
++      if (keep_fd >= 0)
++         close(keep_fd);
++      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
++   }
++
++   *out_keep_fd = keep_fd;
++   *out_fd_info = (VkImportMemoryFdInfoKHR){
++      .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR,
++      .pNext = alloc_info->pNext,
++      .fd = fd,
++      .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
++   };
++   return VK_SUCCESS;
++}
++#endif /* __ANDROID__ */
++
+ static void
+ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
+                               struct vn_command_vkAllocateMemory *args)
+@@ -346,6 +442,12 @@
+              */
+             args->ret = vkr_udmabuf_get_fd_info_from_allocation_info(
+                physical_dev, alloc_info, &udmabuf_fd, &local_import_info);
++#ifdef __ANDROID__
++         } else if (!physical_dev->gbm_device) {
++            /* the kept dma-buf is exported like a udmabuf one */
++            args->ret = vkr_ahb_get_fd_info_from_allocation_info(alloc_info, &udmabuf_fd,
++                                                                 &local_import_info);
++#endif
+          } else {
+             args->ret = vkr_gbm_get_fd_info_from_allocation_info(
+                physical_dev, alloc_info, &gbm_bo, &local_import_info);
