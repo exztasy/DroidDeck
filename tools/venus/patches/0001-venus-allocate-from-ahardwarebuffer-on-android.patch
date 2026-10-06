@@ -5,21 +5,24 @@ only) left vkAllocateMemory with no allocator: gbm and udmabuf do not exist on A
 allocates a BLOB AHardwareBuffer instead; its dma-buf is imported into Vulkan and kept for the
 blob export the guest maps or passes on.
 
-- Host-visible allocations, and every allocation the guest wants to export as a dma-buf whatever
-  its type, take that route.
-- Because they do, dma-buf export is offered to the guest wherever the driver reports dma-buf
-  import (image format and external buffer queries): a compositor in the guest can then export
-  its images.
-- The guest maps the pages without cache maintenance, so cached gralloc memory is asked for only
-  where the driver's type is cached (VKR_AHB_CPU_CACHED=1 forces it, for measuring).
-- The dma-buf's size is checked before import, a memory type the driver will not import gralloc
-  memory into is logged once, and the kept fd is closed when the import fails.
+- Host-visible coherent allocations (the ones the guest maps), and every allocation the guest
+  wants to export as a dma-buf whatever its type, take that route. Cached non-coherent types,
+  which the guest hides as device-local, are allocated directly.
+- Because exports take it, dma-buf export is offered for explicit-modifier image queries where
+  the driver reports dma-buf import: a compositor in the guest can export its output. Not for
+  buffers or other images: the guest cannot import a dma-buf over vtest, so an app exporting to
+  re-import its own memory is better told there is no export.
+- The guest maps the pages without cache maintenance, so cached gralloc usage is asked for only
+  where the driver's type is cached; the dma-buf exporter gralloc picked is logged once per kind.
+- The dma-buf's size is checked before import; a memory type the driver will not import gralloc
+  memory into fails with VK_ERROR_INVALID_EXTERNAL_HANDLE (logged once per type) instead of an
+  invalid import; the kept fd is closed when the import fails.
 
 Binary files pa/src/gallium/auxiliary/util/__pycache__/u_format_parse.cpython-313.pyc and pb/src/gallium/auxiliary/util/__pycache__/u_format_parse.cpython-313.pyc differ
 diff -ruN a/src/venus/vkr_device_memory.c b/src/venus/vkr_device_memory.c
 --- a/src/venus/vkr_device_memory.c
 +++ b/src/venus/vkr_device_memory.c
-@@ -227,6 +227,139 @@
+@@ -227,6 +227,167 @@
  
  #endif /* ENABLE_GBM_ALLOCATION */
  
@@ -27,6 +30,8 @@ diff -ruN a/src/venus/vkr_device_memory.c b/src/venus/vkr_device_memory.c
 +#include <android/hardware_buffer.h>
 +#include <dlfcn.h>
 +#include <pthread.h>
++#include <stdatomic.h>
++#include <stdio.h>
 +#include <unistd.h>
 +
 +/* An Android host whose driver imports dma-bufs but exports no fd at all (Mali: AHardwareBuffer
@@ -66,20 +71,42 @@ diff -ruN a/src/venus/vkr_device_memory.c b/src/venus/vkr_device_memory.c
 +}
 +
 +/* The guest maps these pages directly and never asks for cache maintenance (vtest's flush and
-+ * invalidate do nothing), so a CPU-cached gralloc buffer is only asked for where the driver's own
-+ * memory type is cached; elsewhere the pages are mapped uncached, as the driver's coherent type is.
-+ * VKR_AHB_CPU_CACHED=1 asks for cached pages everywhere, for measuring. */
++ * invalidate do nothing, and gralloc's lock/unlock is never called). Cached gralloc usage is only
++ * asked for where the driver's own memory type is cached; for its coherent type the RARELY usage
++ * is a hint toward uncached pages, not a promise, so the heap gralloc actually chose is logged
++ * once per kind (vkr_ahb_log_heap). */
 +static uint64_t
 +vkr_ahb_cpu_usage(VkMemoryPropertyFlags property_flags)
 +{
-+   static int force_cached = -1;
-+   if (force_cached < 0) {
-+      const char *env = getenv("VKR_AHB_CPU_CACHED");
-+      force_cached = env && env[0] == '1';
-+   }
-+   return (force_cached || (property_flags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT))
++   return (property_flags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT)
 +             ? AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN | AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN
 +             : AHARDWAREBUFFER_USAGE_CPU_READ_RARELY | AHARDWAREBUFFER_USAGE_CPU_WRITE_RARELY;
++}
++
++/* The dma-buf exporter's name ("system", "system-uncached", ...) from fdinfo, once per CPU usage. */
++static void
++vkr_ahb_log_heap(int fd, uint64_t cpu_usage)
++{
++   static atomic_uint logged;
++   const unsigned bit = (cpu_usage & AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN) ==
++                              AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN
++                           ? 1u
++                           : 2u;
++   if (atomic_fetch_or(&logged, bit) & bit)
++      return;
++
++   char path[64], line[128], name[64] = "unknown";
++   snprintf(path, sizeof(path), "/proc/self/fdinfo/%d", fd);
++   FILE *f = fopen(path, "r");
++   if (f) {
++      while (fgets(line, sizeof(line), f)) {
++         if (sscanf(line, "exp_name: %63s", name) == 1)
++            break;
++      }
++      fclose(f);
++   }
++   vkr_log("gralloc memory for %s CPU access comes from dma-buf exporter \"%s\"",
++           bit == 1 ? "cached" : "uncached", name);
 +}
 +
 +static VkResult
@@ -129,20 +156,24 @@ diff -ruN a/src/venus/vkr_device_memory.c b/src/venus/vkr_device_memory.c
 +      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
 +   }
 +
-+   /* Said once per memory type: the guest picked a type the driver will not import gralloc
-+    * memory into, which is where the import below would fail. */
-+   static uint32_t reported_types;
++   vkr_ahb_log_heap(keep_fd, desc.usage);
++
++   /* A type the driver will not import gralloc memory into fails here, cleanly, rather than as
++    * an invalid import (said once per type). */
++   static atomic_uint reported_types;
 +   struct vn_device_proc_table *vk = &dev->proc_table;
 +   VkMemoryFdPropertiesKHR fd_props = { .sType = VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR };
-+   if (alloc_info->memoryTypeIndex < 32 &&
-+       !(reported_types & (1u << alloc_info->memoryTypeIndex)) &&
-+       vk->GetMemoryFdPropertiesKHR(dev->base.handle.device,
++   const uint32_t type_bit = alloc_info->memoryTypeIndex < 32 ? 1u << alloc_info->memoryTypeIndex : 0;
++   if (vk->GetMemoryFdPropertiesKHR(dev->base.handle.device,
 +                                    VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, keep_fd,
-+                                    &fd_props) == VK_SUCCESS &&
-+       !(fd_props.memoryTypeBits & (1u << alloc_info->memoryTypeIndex))) {
-+      reported_types |= 1u << alloc_info->memoryTypeIndex;
-+      vkr_log("memory type %u cannot hold a gralloc dma-buf (the driver allows 0x%x)",
-+              alloc_info->memoryTypeIndex, fd_props.memoryTypeBits);
++                                    &fd_props) != VK_SUCCESS ||
++       !(fd_props.memoryTypeBits & type_bit)) {
++      if (!(atomic_fetch_or(&reported_types, type_bit) & type_bit))
++         vkr_log("memory type %u cannot hold a gralloc dma-buf (the driver allows 0x%x)",
++                 alloc_info->memoryTypeIndex, fd_props.memoryTypeBits);
++      close(fd);
++      close(keep_fd);
++      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
 +   }
 +
 +   *out_keep_fd = keep_fd;
@@ -159,23 +190,28 @@ diff -ruN a/src/venus/vkr_device_memory.c b/src/venus/vkr_device_memory.c
  static void
  vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
                                struct vn_command_vkAllocateMemory *args)
-@@ -281,7 +414,14 @@
+@@ -281,7 +442,19 @@
     int udmabuf_fd = -1;
     void *gbm_bo = NULL;
     VkExportMemoryAllocateInfo local_export_info;
 -   if ((property_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) && !res_info) {
++   bool host_visible_forced = (property_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) && !res_info;
 +#ifdef __ANDROID__
 +   /* the driver exports no dma-buf: one asked for is allocated by gralloc whatever the type */
 +   const bool ahb_export = physical_dev->ahb_dma_buf_export && !res_info && export_info &&
 +                           (export_info->handleTypes & VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT);
++   /* the guest hides host-visible types that are cached but not coherent (it cannot map them),
++    * so those need no gralloc buffer unless an export asks for one */
++   if (physical_dev->ahb_dma_buf_export && !(property_flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT))
++      host_visible_forced = false;
 +#else
 +   const bool ahb_export = false;
 +#endif
-+   if (((property_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) && !res_info) || ahb_export) {
++   if (host_visible_forced || ahb_export) {
        /* An implementation can support dma_buf import along with opaque fd export/import.
         * If the client driver is using external memory and requesting dma_buf, without
         * dma_buf fd export support, we must use gbm bo import path instead of forcing
-@@ -346,6 +486,12 @@
+@@ -346,6 +519,12 @@
               */
              args->ret = vkr_udmabuf_get_fd_info_from_allocation_info(
                 physical_dev, alloc_info, &udmabuf_fd, &local_import_info);
@@ -188,7 +224,7 @@ diff -ruN a/src/venus/vkr_device_memory.c b/src/venus/vkr_device_memory.c
           } else {
              args->ret = vkr_gbm_get_fd_info_from_allocation_info(
                 physical_dev, alloc_info, &gbm_bo, &local_import_info);
-@@ -369,6 +515,8 @@
+@@ -369,6 +548,8 @@
     if (!mem) {
        if (local_import_info.fd >= 0)
           close(local_import_info.fd);
@@ -200,12 +236,13 @@ diff -ruN a/src/venus/vkr_device_memory.c b/src/venus/vkr_device_memory.c
 diff -ruN a/src/venus/vkr_physical_device.c b/src/venus/vkr_physical_device.c
 --- a/src/venus/vkr_physical_device.c
 +++ b/src/venus/vkr_physical_device.c
-@@ -233,6 +233,14 @@
+@@ -233,6 +233,15 @@
         physical_dev->EXT_external_memory_dma_buf)
        physical_dev->gbm_device = vkr_physical_device_get_gbm_device();
  
 +#ifdef __ANDROID__
 +   physical_dev->ahb_dma_buf_export = !physical_dev->is_dma_buf_fd_export_supported &&
++                                      physical_dev->KHR_external_memory_fd &&
 +                                      physical_dev->EXT_external_memory_dma_buf &&
 +                                      !physical_dev->gbm_device;
 +   if (physical_dev->ahb_dma_buf_export)
@@ -215,13 +252,13 @@ diff -ruN a/src/venus/vkr_physical_device.c b/src/venus/vkr_physical_device.c
     physical_dev->udmabuf_dev_fd = -1;
     if (VKR_DEBUG(UDMABUF)) {
        if (physical_dev->EXT_external_memory_dma_buf)
-@@ -703,6 +711,19 @@
+@@ -703,6 +712,19 @@
                                            args->pFormatProperties);
  }
  
-+/* What the driver can import as a dma-buf, vkr can also hand out as one: the allocation is a
-+ * gralloc buffer imported as a dma-buf (vkr_dispatch_vkAllocateMemory), and that dma-buf is what
-+ * an export returns. */
++/* What the driver can import as a dma-buf, vkr can also hand out as one: an allocation asked to
++ * export a dma-buf is a gralloc buffer imported as one (vkr_dispatch_vkAllocateMemory), and that
++ * dma-buf is what the export returns. */
 +static void
 +vkr_physical_device_offer_ahb_export(VkExternalMemoryProperties *props)
 +{
@@ -235,7 +272,7 @@ diff -ruN a/src/venus/vkr_physical_device.c b/src/venus/vkr_physical_device.c
  static void
  vkr_dispatch_vkGetPhysicalDeviceImageFormatProperties2(
     UNUSED struct vn_dispatch_context *dispatch,
-@@ -715,6 +736,18 @@
+@@ -715,6 +737,22 @@
     vn_replace_vkGetPhysicalDeviceImageFormatProperties2_args_handle(args);
     args->ret = vk->GetPhysicalDeviceImageFormatProperties2(
        args->physicalDevice, args->pImageFormatInfo, args->pImageFormatProperties);
@@ -247,22 +284,14 @@ diff -ruN a/src/venus/vkr_physical_device.c b/src/venus/vkr_physical_device.c
 +      VkExternalImageFormatProperties *ext_props =
 +         vkr_find_struct(args->pImageFormatProperties->pNext,
 +                         VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES);
++      /* Only for explicit-modifier images, the queries a compositor makes before exporting
++       * its output: the guest cannot import a dma-buf over vtest, so an app that exports to
++       * import its own memory again (shared resources) is better told there is no export. */
 +      if (ext_info && ext_props &&
-+          ext_info->handleType == VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT)
++          ext_info->handleType == VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT &&
++          args->pImageFormatInfo->tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT)
 +         vkr_physical_device_offer_ahb_export(&ext_props->externalMemoryProperties);
 +   }
- }
- 
- static void
-@@ -743,6 +776,11 @@
-    vn_replace_vkGetPhysicalDeviceExternalBufferProperties_args_handle(args);
-    vk->GetPhysicalDeviceExternalBufferProperties(
-       args->physicalDevice, args->pExternalBufferInfo, args->pExternalBufferProperties);
-+
-+   if (physical_dev->ahb_dma_buf_export &&
-+       args->pExternalBufferInfo->handleType == VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT)
-+      vkr_physical_device_offer_ahb_export(
-+         &args->pExternalBufferProperties->externalMemoryProperties);
  }
  
  static void

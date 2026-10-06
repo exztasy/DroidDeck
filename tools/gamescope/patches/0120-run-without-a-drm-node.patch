@@ -2,25 +2,52 @@ gamescope: run on a Vulkan device that names no DRM node (Venus over vtest)
 
 On a Mali phone the runtime's Vulkan is Mesa's Venus over a vtest socket to a server on the
 device's own driver. Venus reports VK_EXT_physical_device_drm with no primary and no render node,
-has no VK_KHR_external_semaphore_fd (vtest has no external sync), and can neither import dma-bufs
-nor export them except through the server's host-visible (gralloc) allocations. With no node:
+has no VK_KHR_external_semaphore_fd (vtest has no external sync), and can export dma-bufs (the
+server's gralloc allocations) but never import one. With no node:
 
 - createDevice runs as if the extension were absent instead of failing on the primary node;
 - VK_KHR_external_semaphore_fd is optional and the Wayland backend offers no explicit sync
   (DRM syncobj timelines need a render node);
 - flippable images skip the host's DRM_FORMAT_MOD_INVALID entry, and with no exportable modifier
-  fall back to a plain LINEAR image exported as DRM_FORMAT_MOD_LINEAR instead of asserting;
-- exportable images prefer a host-visible memory type, the one the server shares as gralloc;
-- wl_shm textures are composited rather than flipped, and copied again at every commit (the
-  per-wlr_buffer memo kept showing the first copy of a redrawn wl_buffer).
+  fall back to a plain LINEAR image exported as DRM_FORMAT_MOD_LINEAR (logged) instead of
+  asserting;
+- wl_shm uploads are not exported: they are copied again at every commit (the per-wlr_buffer memo
+  kept showing the first copy of a redrawn wl_buffer), counted ready without a dma-buf fence,
+  and composited - a layer with no host buffer forces composition, and a plane is only handed
+  to the host when its texture has one.
 
-A device with a DRM node (Turnip on Adreno) takes none of these paths.
+A device with a DRM node (Turnip on Adreno) takes none of these paths: every new branch is keyed
+on the device naming no node, or on a texture that has no backend fb, which only happens there.
 
 diff --git a/src/Backends/WaylandBackend.cpp b/src/Backends/WaylandBackend.cpp
-index c400978..6dd558d 100644
+index c400978..b862b21 100644
 --- a/src/Backends/WaylandBackend.cpp
 +++ b/src/Backends/WaylandBackend.cpp
-@@ -2330,7 +2330,8 @@ namespace gamescope
+@@ -1110,6 +1110,14 @@ namespace gamescope
+ 
+             bNeedsFullComposite |= !!(g_uCompositeDebug & CompositeDebugFlag::Heatmap);
+ 
++            // A layer with no host buffer (a CPU upload on a device without a DRM node) cannot be
++            // handed to the host as a plane.
++            for ( int i = 0; i < pFrameInfo->layers.count(); i++ )
++            {
++                if ( pFrameInfo->layers.get( i ).tex && !pFrameInfo->layers.get( i ).tex->GetBackendFb() )
++                    bNeedsFullComposite = true;
++            }
++
+             if ( !bNeedsFullComposite )
+             {
+                 bool bNeedsBacking = true;
+@@ -1664,7 +1672,7 @@ namespace gamescope
+ 
+     void CWaylandPlane::Present( const FrameInfo_t::Layer_t *pLayer )
+     {
+-        CWaylandFb *pWaylandFb = pLayer && pLayer->tex != nullptr ? static_cast<CWaylandFb*>( pLayer->tex->GetBackendFb()->EnsureImported() ) : nullptr;
++        CWaylandFb *pWaylandFb = pLayer && pLayer->tex != nullptr && pLayer->tex->GetBackendFb() ? static_cast<CWaylandFb*>( pLayer->tex->GetBackendFb()->EnsureImported() ) : nullptr;
+         wl_buffer *pBuffer = pWaylandFb ? pWaylandFb->GetHostBuffer() : nullptr;
+ 
+         if ( pBuffer )
+@@ -2330,7 +2338,8 @@ namespace gamescope
  
      bool CWaylandBackend::SupportsExplicitSync() const
      {
@@ -31,7 +58,7 @@ index c400978..6dd558d 100644
  
      bool CWaylandBackend::IsPaused() const
 diff --git a/src/rendervulkan.cpp b/src/rendervulkan.cpp
-index ffad695..2f29fb0 100644
+index ffad695..9023444 100644
 --- a/src/rendervulkan.cpp
 +++ b/src/rendervulkan.cpp
 @@ -478,6 +478,12 @@ bool CVulkanDevice::createDevice()
@@ -100,7 +127,7 @@ index ffad695..2f29fb0 100644
  		modifierListInfo = {
  			.sType = VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT,
  			.pNext = std::exchange(imageInfo.pNext, &modifierListInfo),
-@@ -2287,7 +2313,18 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
+@@ -2287,7 +2313,19 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
  		imageInfo.tiling = tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
  	}
  
@@ -109,6 +136,7 @@ index ffad695..2f29fb0 100644
 +	{
 +		// No modifier to export with and no DRM node: a plain linear image, exported as
 +		// DRM_FORMAT_MOD_LINEAR, which any importer understands.
++		vk_log.infof( "no exportable modifier for format 0x%x (%ux%u): exporting a LINEAR image", drmFormat, width, height );
 +		imageInfo.tiling = tiling = VK_IMAGE_TILING_LINEAR;
 +		externalImageCreateInfo = {
 +			.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
@@ -120,22 +148,7 @@ index ffad695..2f29fb0 100644
  	{
  		// We want to scan-out the image
  		wsiImageCreateInfo = {
-@@ -2337,6 +2374,14 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
- 		.allocationSize = memRequirements.size,
- 		.memoryTypeIndex = uint32_t(g_device.findMemoryType(properties, memRequirements.memoryTypeBits)),
- 	};
-+	// Without a DRM node the exported memory is shared through the renderer's host-visible
-+	// allocations (Venus on Android: gralloc buffers); ask for one where the image allows it.
-+	if ( flags.bExportable && !pDMA && g_device.noDrmNode() )
-+	{
-+		int32_t visibleType = g_device.findMemoryType( properties | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, memRequirements.memoryTypeBits );
-+		if ( visibleType >= 0 )
-+			allocInfo.memoryTypeIndex = uint32_t( visibleType );
-+	}
- 
- 	m_size = allocInfo.allocationSize;
- 
-@@ -2548,7 +2593,7 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
+@@ -2548,7 +2586,7 @@ bool CVulkanTexture::BInit( uint32_t width, uint32_t height, uint32_t depth, uin
  			g_device.vk.GetImageSubresourceLayout( g_device.device(), m_vkImage, &subresource, &subresourceLayout );
  
  			dmabuf.n_planes = 1;
@@ -144,7 +157,18 @@ index ffad695..2f29fb0 100644
  			dmabuf.offset[0] = 0;
  			dmabuf.stride[0] = subresourceLayout.rowPitch;
  		}
-@@ -4820,7 +4865,9 @@ gamescope::OwningRc<CVulkanTexture> vulkan_create_texture_from_wlr_buffer( struc
+@@ -2792,6 +2830,10 @@ CVulkanTexture::~CVulkanTexture( void )
+ 
+ int CVulkanTexture::memoryFence()
+ {
++	// Only an exported image has a dma-buf to poll.
++	if ( !m_bExternal )
++		return -1;
++
+ 	const VkMemoryGetFdInfoKHR memory_get_fd_info = {
+ 		.sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR,
+ 		.memory = m_vkImageMemory,
+@@ -4820,7 +4862,9 @@ gamescope::OwningRc<CVulkanTexture> vulkan_create_texture_from_wlr_buffer( struc
  	CVulkanTexture::createFlags texCreateFlags;
  	texCreateFlags.bSampled = true;
  	texCreateFlags.bTransferDst = true;
@@ -178,7 +202,7 @@ index fa519db..edd71c9 100644
  	bool m_bInitialized = false;
  
 diff --git a/src/steamcompmgr.cpp b/src/steamcompmgr.cpp
-index 372a82c..976b69e 100644
+index 372a82c..b3f13e5 100644
 --- a/src/steamcompmgr.cpp
 +++ b/src/steamcompmgr.cpp
 @@ -1850,7 +1850,13 @@ import_commit (
@@ -206,3 +230,23 @@ index 372a82c..976b69e 100644
  
  	return commit;
  }
+@@ -8601,10 +8608,18 @@ void update_wayland_res(CommitDoneList_t *doneCommits, steamcompmgr_win_t *w, Re
+ 		{
+ 			fence = dup( dmabuf.fd[0] );
+ 		}
+-		else
++		else if ( newCommit->vulkanTex->externalImage() )
+ 		{
+ 			fence = newCommit->vulkanTex->memoryFence();
+ 		}
++		else
++		{
++			// A CPU upload into a texture that was never exported (no DRM node): it has no
++			// dma-buf to wait on, and vulkan_create_texture_from_wlr_buffer already waited for
++			// the copy.
++			fence = -1;
++			bKnownReady = true;
++		}
+ 	}
+ 
+ 	gpuvis_trace_printf( "pushing wait for commit %lu win %lx", newCommit->commitID, w->type == steamcompmgr_win_type_t::XWAYLAND ? w->xwayland().id : 0 );

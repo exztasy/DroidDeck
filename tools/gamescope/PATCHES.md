@@ -41,12 +41,13 @@ library list, before anything is published.
 
 - `0120-run-without-a-drm-node.patch` - this app: on a Mali phone the runtime's Vulkan is Mesa's
   Venus over a vtest socket (tools/venus), which reports VK_EXT_physical_device_drm with no node,
-  has no VK_KHR_external_semaphore_fd, and cannot import dma-bufs. gamescope then runs as on a
-  device without the DRM extension: no explicit sync, flippable images exported LINEAR from a
-  host-visible type (the server shares those as gralloc buffers), wl_shm uploads composited
-  rather than flipped and copied at every commit (the buffer memo kept showing a redrawn
-  wl_buffer's first frame). Every change is keyed on the device naming no DRM node, so Turnip on
-  Adreno takes none of them.
+  has no VK_KHR_external_semaphore_fd, and can export dma-bufs but never import one. gamescope then
+  runs as on a device without the DRM extension: no explicit sync, flippable images exported with
+  an explicit modifier or, failing that, as LINEAR; wl_shm uploads are not exported but copied at
+  every commit (the buffer memo kept showing a redrawn wl_buffer's first frame), counted ready
+  without a dma-buf fence, and composited (a layer with no host buffer forces composition). Every
+  change is keyed on the device naming no DRM node, or on a texture without a backend fb, which
+  only happens there, so Turnip on Adreno takes none of them.
 
 Sixteen more of Armada's patches are DRM/lease/HDR-on-KMS work for a native display, which this
 app's Wayland-hosted gamescope never reaches, or need a newer gamescope than the runtime has.

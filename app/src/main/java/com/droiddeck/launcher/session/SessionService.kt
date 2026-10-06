@@ -525,6 +525,10 @@ class SessionService : Service() {
             // node for DRI3: every program presents through CPU images instead (wl_shm on
             // Wayland, PutImage on X11). gamescope's own output is unaffected - it uses no WSI.
             guest.add("MESA_VK_WSI_DEBUG=sw")
+            // Allocations go to the server synchronously while the bridge is new: one the server
+            // refuses then fails as vkAllocateMemory, which a program logs, instead of hanging it
+            // on a socket the server has dropped.
+            guest.add("VN_PERF=no_async_mem_alloc")
             guest.add("BL_VENUS=1")
             Log.i(TAG, "venus: the session draws through Venus on ${DeviceSupport.gpuName()} ($venusSocket)")
         } else {
