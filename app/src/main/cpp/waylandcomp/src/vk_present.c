@@ -925,12 +925,19 @@ int vkp_dmabuf_modifiers(uint32_t drm_format, uint64_t *out, int max) {
     list.pDrmFormatModifierProperties = props;
     g_vk.GetPhysicalDeviceFormatProperties2(g_pd, fmt, &fp);
 
-    int n = 0;
+    int n = 0, unknown = 0;
+    uint64_t unknown_vendors = 0;   /* bit per DRM modifier vendor (the top byte) */
     for (uint32_t i = 0; i < list.drmFormatModifierCount; i++) {
         uint64_t m = props[i].drmFormatModifier;
         const char *why = NULL;
-        if (m != VKP_MOD_LINEAR && m != VKP_MOD_QCOM_COMPRESSED) why = "unknown layout";
-        else if (props[i].drmFormatModifierPlaneCount != 1) why = "not single-plane";
+        /* Layouts this compositor has no use for - Mali lists some sixty AFBC/AFRC variants per
+         * format - are counted, not logged one by one. */
+        if (m != VKP_MOD_LINEAR && m != VKP_MOD_QCOM_COMPRESSED) {
+            unknown++;
+            unknown_vendors |= 1ull << ((m >> 56) & 63);
+            continue;
+        }
+        if (props[i].drmFormatModifierPlaneCount != 1) why = "not single-plane";
         else if (!(props[i].drmFormatModifierTilingFeatures & VK_FORMAT_FEATURE_BLIT_SRC_BIT)) why = "no blit source";
         else if (!modifier_importable(fmt, m, VK_IMAGE_USAGE_TRANSFER_SRC_BIT)) why = "not importable as a dma-buf";
         if (why) {
@@ -941,6 +948,10 @@ int vkp_dmabuf_modifiers(uint32_t drm_format, uint64_t *out, int max) {
         }
         if (n < max) out[n++] = m;
     }
+    if (unknown)
+        LOGI("dmabuf: %c%c%c%c: %d other driver layouts not advertised (modifier vendors 0x%llx; ARM is bit 8)",
+             drm_format & 0xff, (drm_format >> 8) & 0xff, (drm_format >> 16) & 0xff,
+             (drm_format >> 24) & 0xff, unknown, (unsigned long long)unknown_vendors);
     free(props);
     return n;
 }
